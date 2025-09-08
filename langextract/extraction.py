@@ -24,6 +24,7 @@ import warnings
 from langextract import annotation
 from langextract import factory
 from langextract import io
+from langextract import prompt_validation as pv
 from langextract import prompting
 from langextract import resolver
 from langextract.core import data
@@ -46,11 +47,16 @@ def extract(
     additional_context: str | None = None,
     resolver_params: dict | None = None,
     language_model_params: dict | None = None,
-    debug: bool = True,
+    debug: bool = False,
     model_url: str | None = None,
     extraction_passes: int = 1,
     config: typing.Any = None,
     model: typing.Any = None,
+    *,
+    fetch_urls: bool = True,
+    prompt_validation_level: pv.PromptValidationLevel = pv.PromptValidationLevel.WARNING,
+    prompt_validation_strict: bool = False,
+    show_progress: bool = True,
 ) -> typing.Any:
   """Extracts structured information from text.
 
@@ -61,8 +67,8 @@ def extract(
 
   Args:
       text_or_documents: The source text to extract information from, a URL to
-        download text from (starting with http:// or https://), or an iterable
-        of Document objects.
+        download text from (starting with http:// or https:// when fetch_urls
+        is True), or an iterable of Document objects.
       prompt_description: Instructions for what to extract from the text.
       examples: List of ExampleData objects to guide the extraction.
       api_key: API key for Gemini or other LLM services (can also use
@@ -110,7 +116,13 @@ def extract(
         None): Suffix for keys indicating extraction order. Default is None
         (order by appearance). - 'extraction_attributes_suffix' (str | None):
         Suffix for keys containing extraction attributes. Default is
-        "_attributes".
+        "_attributes". Additional alignment parameters can be included:
+        'enable_fuzzy_alignment' (bool): Whether to use fuzzy matching if exact
+        matching fails. Disabling this can improve performance but may reduce
+        recall. Default is True. 'fuzzy_alignment_threshold' (float): Minimum
+        token overlap ratio for fuzzy match (0.0-1.0). Default is 0.75.
+        'accept_match_lesser' (bool): Whether to accept partial exact matches.
+        Default is True.
       language_model_params: Additional parameters for the language model.
       debug: Whether to enable debug logging. When True, enables detailed logging
         of function calls, arguments, return values, and timing for the langextract
@@ -129,6 +141,16 @@ def extract(
         and config are provided, model takes precedence.
       model: Pre-configured language model to use for extraction. Takes
         precedence over all other parameters including config.
+      fetch_urls: Whether to automatically download content when the input is a
+        URL string. When True (default), strings starting with http:// or
+        https:// are fetched. When False, all strings are treated as literal
+        text to analyze. This is a keyword-only parameter.
+      prompt_validation_level: Controls pre-flight alignment checks on few-shot
+        examples. OFF skips validation, WARNING logs issues but continues, ERROR
+        raises on failures. Defaults to WARNING.
+      prompt_validation_strict: When True and prompt_validation_level is ERROR,
+        raises on non-exact matches (MATCH_FUZZY, MATCH_LESSER). Defaults to False.
+      show_progress: Whether to show progress bar during extraction. Defaults to True.
 
   Returns:
       An AnnotatedDocument with the extracted information when input is a
@@ -139,11 +161,24 @@ def extract(
       ValueError: If examples is None or empty.
       ValueError: If no API key is provided or found in environment variables.
       requests.RequestException: If URL download fails.
+      pv.PromptAlignmentError: If validation fails in ERROR mode.
   """
   if not examples:
     raise ValueError(
         "Examples are required for reliable extraction. Please provide at least"
         " one ExampleData object with sample extractions."
+    )
+
+  if prompt_validation_level is not pv.PromptValidationLevel.OFF:
+    report = pv.validate_prompt_alignment(
+        examples=examples,
+        aligner=resolver.WordAligner(),
+        policy=pv.AlignmentPolicy(),
+    )
+    pv.handle_alignment_report(
+        report,
+        level=prompt_validation_level,
+        strict_non_exact=prompt_validation_strict,
     )
 
   if debug:
@@ -163,7 +198,11 @@ def extract(
         UserWarning,
     )
 
-  if isinstance(text_or_documents, str) and io.is_url(text_or_documents):
+  if (
+      fetch_urls
+      and isinstance(text_or_documents, str)
+      and io.is_url(text_or_documents)
+  ):
     text_or_documents = io.download_text_from_url(text_or_documents)
 
   prompt_template = prompting.PromptTemplateStructured(
@@ -252,7 +291,26 @@ def extract(
   }
   resolver_defaults.update(resolver_params or {})
 
-  res = resolver.Resolver(**resolver_defaults)
+  effective_params = dict(resolver_defaults)
+
+  alignment_kwargs = {}
+  for key in resolver.ALIGNMENT_PARAM_KEYS:
+    val = effective_params.pop(key, None)
+    if val is not None:
+      alignment_kwargs[key] = val
+
+  try:
+    res = resolver.Resolver(**effective_params)
+  except TypeError as e:
+    msg = str(e)
+    if (
+        "unexpected keyword argument" in msg
+        or "got an unexpected keyword argument" in msg
+    ):
+      raise TypeError(
+          f"Unknown key in resolver_params; check spelling: {e}"
+      ) from e
+    raise
 
   annotator = annotation.Annotator(
       language_model=language_model,
@@ -270,7 +328,9 @@ def extract(
         additional_context=additional_context,
         debug=debug,
         extraction_passes=extraction_passes,
+        show_progress=show_progress,
         max_workers=max_workers,
+        **alignment_kwargs,
     )
   else:
     documents = cast(Iterable[data.Document], text_or_documents)
@@ -281,5 +341,7 @@ def extract(
         batch_length=batch_length,
         debug=debug,
         extraction_passes=extraction_passes,
+        show_progress=show_progress,
         max_workers=max_workers,
+        **alignment_kwargs,
     )
